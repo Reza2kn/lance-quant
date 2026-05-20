@@ -103,6 +103,40 @@ def _streaming_bf16_loader(model, model_args):
 # ---------------------------------------------------------------------------
 
 
+class WQLinearINT5(torch.nn.Module):
+    """5-bit asymmetric grouped, uint8-per-code storage.
+    Matches output of scripts/awq_apply_5bit.py."""
+    MODE = "ondemand"
+
+    def __init__(self, in_features, out_features, group_size, bias, device, dtype=torch.bfloat16):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.group_size = group_size
+        self.compute_dtype = dtype
+        n_groups = in_features // group_size
+        self.register_buffer("qweight", torch.zeros(
+            (out_features, in_features), dtype=torch.uint8, device=device))
+        self.register_buffer("scales",  torch.zeros(
+            (out_features, n_groups), dtype=dtype, device=device))
+        self.register_buffer("zeros",   torch.zeros(
+            (out_features, n_groups), dtype=torch.uint8, device=device))
+        if bias:
+            self.bias = torch.nn.Parameter(torch.zeros(out_features, dtype=dtype, device=device))
+        else:
+            self.register_parameter("bias", None)
+
+    def _dequantize(self):
+        codes = self.qweight.to(self.compute_dtype)
+        u = codes.reshape(self.out_features, -1, self.group_size)
+        z = self.zeros.unsqueeze(-1).to(self.compute_dtype)
+        s = self.scales.unsqueeze(-1)
+        return ((u - z) * s).reshape(self.out_features, self.in_features)
+
+    def forward(self, x):
+        return torch.nn.functional.linear(x, self._dequantize(), self.bias)
+
+
 class WQLinearINT4(torch.nn.Module):
     """Drop-in for nn.Linear with 4-bit grouped asymmetric weight storage.
 
@@ -153,8 +187,13 @@ class WQLinearINT4(torch.nn.Module):
 
 
 def swap_to_awq(model, awq_dir: Path, compute_dtype=torch.bfloat16):
-    meta = json.loads((awq_dir / "awq_meta.json").read_text())["per_weight"]
-    print(f"[awq-swap] {len(meta)} linears to quantize")
+    meta_doc = json.loads((awq_dir / "awq_meta.json").read_text())
+    meta = meta_doc["per_weight"]
+    # n_bit: 4 (default) uses WQLinearINT4 with nibble packing;
+    # n_bit: 5 uses WQLinearINT5 with byte-per-code storage.
+    n_bit = meta_doc.get("n_bit", 4)
+    LinClass = WQLinearINT5 if n_bit == 5 else WQLinearINT4
+    print(f"[awq-swap] n_bit={n_bit}, swapping {len(meta)} linears to {LinClass.__name__}")
     modules_by_name = dict(model.named_modules())
     swapped = 0
     for wkey in meta:
@@ -169,7 +208,7 @@ def swap_to_awq(model, awq_dir: Path, compute_dtype=torch.bfloat16):
             continue
         device = old.weight.device if old.weight.device.type != "meta" else (
             next((p.device for p in model.parameters() if p.device.type != "meta"), torch.device("cuda")))
-        new = WQLinearINT4(
+        new = LinClass(
             in_features=info["shape"][1],
             out_features=info["shape"][0],
             group_size=info["group_size"],
