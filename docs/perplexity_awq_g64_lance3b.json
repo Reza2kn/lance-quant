@@ -1,0 +1,8 @@
+{
+  "perplexity": 927.3657690462792,
+  "total_tokens": 480,
+  "avg_logp_per_token": -6.83234806060791,
+  "elapsed_s": 1.4684290885925293,
+  "awq_dir": "/home/rezo/lance-quant/models/Lance_3B-AWQ-INT4-g64",
+  "model_path": "/home/rezo/lance-quant/weights/hub/Lance_3B"
+}

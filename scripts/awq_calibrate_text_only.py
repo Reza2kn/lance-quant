@@ -147,6 +147,9 @@ def main():
                     p.data.copy_(t.to(device))
             n_loaded += 1
     print(f"[load] {n_loaded} LLM tensors in {time.time()-t0:.1f}s")
+    # Force everything to device + bf16 (catches Embedding params that
+    # weren't on meta device after meta_init)
+    llm = llm.to(device=device, dtype=torch.bfloat16)
     llm.eval()
     if torch.cuda.is_available():
         print(f"[load] GPU mem: {torch.cuda.memory_allocated()/1e9:.2f} GB")

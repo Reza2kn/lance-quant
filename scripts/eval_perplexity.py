@@ -3,9 +3,10 @@
 For text completion only — runs the language_model on chunks of held-out
 text, sums log-likelihood per token, returns perplexity = exp(-mean_logp).
 
-Uses the same memory-frugal loader as our other scripts (meta-init +
-streaming bf16). For a 4-bit AWQ run, the WQLinearINT4 swap happens via
-the patches/quantized_linear.py path.
+Uses an LLM-only memory-frugal loader (meta-init + streaming bf16). For a
+4-bit AWQ run, the WQLinearINT4 swap happens via run_quant_eval.py. The
+wrapper is intentionally named `language_model` so AWQ keys match the full
+Lance checkpoint without constructing ViT/VAE modules.
 
 Comparison: run on the bf16 baseline, then the AWQ variant; report PPL diff.
 
@@ -59,79 +60,112 @@ CORPUS = [
 ]
 
 
-def build_lance(model_path: Path, vit_path: Path, awq_dir: Path | None):
-    """Construct Lance via inference_lance.main and stop right before the
-    validation loop. Returns the model handle."""
-    src_root = Path(__file__).resolve().parent
-    # Run inference_lance with our usual args, but install a side-channel that
-    # captures the model and exits the validation loop after a single call.
-    import inference_lance as IL
-    from modeling.lance import Lance
-    from modeling.lance.qwen2_navit import Qwen2ForCausalLM
-    from modeling.vit.qwen2_5_vl_vit import Qwen2_5_VisionTransformerPretrainedModel
+class LLMWrapper(torch.nn.Module):
+    def __init__(self, language_model: torch.nn.Module):
+        super().__init__()
+        self.language_model = language_model
 
-    _OQ, _OV, _OL = Qwen2ForCausalLM.__init__, \
-        Qwen2_5_VisionTransformerPretrainedModel.__init__, Lance.__init__
-    def _Q(self, c):
-        with _meta_init(): _OQ(self, c)
-    def _V(self, c):
-        with _meta_init(): _OV(self, c)
-    def _L(self, *a, **k):
-        with _meta_init(): _OL(self, *a, **k)
-    Qwen2ForCausalLM.__init__ = _Q
-    Qwen2_5_VisionTransformerPretrainedModel.__init__ = _V
-    Lance.__init__ = _L
+
+def _build_llm_config(model_path: Path):
+    from modeling.qwen2.modeling_qwen2 import Qwen2Config
+
+    cfg_dict = json.loads((model_path / "llm_config.json").read_text())
+    cfg = Qwen2Config(**{k: v for k, v in cfg_dict.items() if not isinstance(v, dict)})
+    cfg.layer_module = "Qwen2MoTDecoderLayer"
+    cfg.qk_norm = True
+    cfg.qk_norm_und = True
+    cfg.qk_norm_gen = True
+    cfg.freeze_und = False
+    cfg.tie_word_embeddings = False
+    cfg.apply_qwen_2_5_vl_pos_emb = True
+    cfg.rope_scaling = cfg_dict.get("rope_scaling")
+    if cfg.rope_scaling is not None and "type" in cfg.rope_scaling:
+        cfg.rope_scaling.setdefault("rope_type", cfg.rope_scaling["type"])
+    return cfg
+
+
+def _stream_bf16_llm(llm: torch.nn.Module, model_path: Path, device: torch.device):
+    own = dict(llm.state_dict(keep_vars=True))
+    loaded = 0
+    t0 = time.time()
+    with safe_open(str(model_path / "model.safetensors"), framework="pt", device="cpu") as f:
+        for k in f.keys():
+            if not k.startswith("language_model."):
+                continue
+            local = k[len("language_model."):]
+            if local not in own:
+                continue
+            src = f.get_tensor(k)
+            if src.is_floating_point() and src.dtype != torch.bfloat16:
+                src = src.to(torch.bfloat16)
+            target = own[local]
+            with torch.no_grad():
+                if target.device.type == "meta":
+                    target.data = src.to(device)
+                else:
+                    target.data.copy_(src.to(device), non_blocking=True)
+            loaded += 1
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    print(f"[load] streamed {loaded} LLM tensors in {time.time()-t0:.1f}s")
+
+
+def _materialize_meta_tensors(module: torch.nn.Module, device: torch.device):
+    """Allocate still-meta tensors in-place without touching real tensors."""
+    n_params = 0
+    n_buffers = 0
+    for child in module.modules():
+        for name, param in list(child.named_parameters(recurse=False)):
+            if param is None or param.device.type != "meta":
+                continue
+            dtype = torch.bfloat16 if param.dtype.is_floating_point else param.dtype
+            child._parameters[name] = torch.nn.Parameter(
+                torch.empty(param.shape, dtype=dtype, device=device),
+                requires_grad=param.requires_grad,
+            )
+            n_params += 1
+        for name, buf in list(child.named_buffers(recurse=False)):
+            if buf is None or buf.device.type != "meta":
+                continue
+            dtype = torch.bfloat16 if buf.dtype.is_floating_point else buf.dtype
+            child._buffers[name] = torch.empty(buf.shape, dtype=dtype, device=device)
+            n_buffers += 1
+    if n_params or n_buffers:
+        print(f"[alloc] materialized meta tensors: params={n_params}, buffers={n_buffers}")
+
+
+def build_lance(model_path: Path, vit_path: Path, awq_dir: Path | None):
+    """Build only Lance's language_model. Returns an LLMWrapper + tokenizer."""
+    src_root = Path(__file__).resolve().parent
+    from modeling.lance.qwen2_navit import Qwen2ForCausalLM
+    from modeling.qwen2 import Qwen2Tokenizer
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    cfg = _build_llm_config(model_path)
+    print("[build] meta-init Qwen2ForCausalLM only (no ViT/VAE)")
+    with _meta_init():
+        llm = Qwen2ForCausalLM(cfg)
+    llm.to(dtype=torch.bfloat16)
+    llm.to_empty(device=device)
+    wrapper = LLMWrapper(llm)
 
     if awq_dir:
         sys.path.insert(0, str(src_root))
         from run_quant_eval import (swap_to_awq, stream_pass_through_weights,
                                       stream_awq_buffers, WQLinearINT4)
         WQLinearINT4.MODE = "ondemand"
-        def _loader(model, model_args):
-            mods = swap_to_awq(model, Path(awq_dir))
-            stream_pass_through_weights(model, Path(awq_dir))
-            stream_awq_buffers(mods, Path(awq_dir))
-            class _M:
-                missing_keys, unexpected_keys = [], []
-            return _M()
-        IL.init_from_model_path_if_needed = _loader
+        mods = swap_to_awq(wrapper, Path(awq_dir))
+        _materialize_meta_tensors(wrapper, device)
+        stream_pass_through_weights(wrapper, Path(awq_dir))
+        stream_awq_buffers(mods, Path(awq_dir))
     else:
-        from run_baseline import _streaming_bf16_loader
-        IL.init_from_model_path_if_needed = _streaming_bf16_loader
+        _materialize_meta_tensors(llm, device)
+        _stream_bf16_llm(llm, model_path, device)
 
-    sys.argv = [
-        "inference_lance.py",
-        "--model_path", str(model_path), "--vit_path", str(vit_path),
-        "--vit_type", "qwen_2_5_vl_original",
-        "--llm_qk_norm", "true", "--llm_qk_norm_und", "true",
-        "--llm_qk_norm_gen", "true", "--tie_word_embeddings", "false",
-        "--validation_num_timesteps", "1", "--validation_timestep_shift", "3.5",
-        "--copy_init_moe", "true", "--max_num_frames", "121",
-        "--max_latent_size", "64", "--latent_patch_size", "1", "1", "1",
-        "--visual_und", "true", "--visual_gen", "true",
-        "--vae_model_type", "wan", "--apply_qwen_2_5_vl_pos_emb", "true",
-        "--apply_chat_template", "false", "--cfg_type", "0",
-        "--validation_data_seed", "42",
-        "--video_height", "768", "--video_width", "768", "--num_frames", "1",
-        "--task", "x2t_image", "--save_path_gen", "results/_ppl_bootstrap",
-        "--resolution", "image_768res", "--text_template", "true",
-        "--cfg_text_scale", "4.0", "--use_KVcache", "true",
-        "--val_dataset_config_file", "config/examples/x2t_image_example.json",
-    ]
-
-    state = {}
-    orig_validate = IL.validate_on_fixed_batch
-    def _capture(*a, **kw):
-        state["model"] = kw.get("fsdp_model") or a[0]
-        state["tokenizer"] = kw.get("tokenizer")
-        raise StopIteration                                # abort the run after model build
-    IL.validate_on_fixed_batch = _capture
-    try:
-        IL.main()
-    except StopIteration:
-        pass
-    IL.validate_on_fixed_batch = orig_validate
-    return state["model"], state["tokenizer"]
+    wrapper.eval()
+    if torch.cuda.is_available():
+        print(f"[load] GPU mem: {torch.cuda.memory_allocated()/1e9:.2f} GB")
+    return wrapper, Qwen2Tokenizer.from_pretrained(model_path)
 
 
 @torch.no_grad()
@@ -161,9 +195,10 @@ def compute_perplexity(model, tokenizer, corpus, max_seq: int = 256):
         out = inner.model.forward_inference(
             packed_query_sequence=emb.squeeze(0),
             query_lens=torch.tensor([L], device=device),
-            packed_query_position_ids=pos.squeeze(1),         # [3, L]
+            packed_query_position_ids=pos,                    # [3, 1, L]
             packed_query_indexes=torch.arange(L, device=device),
             mode="und",
+            update_past_key_values=False,
         )
         hidden = out.packed_query_sequence                    # [L, H]
         logits = inner.lm_head(hidden)                        # [L, V]
