@@ -1,8 +1,12 @@
 __pycache__/
 *.pyc
 .DS_Store
-models/*/awq_state_dict.safetensors
-models/*/nvfp4_state_dict.safetensors
-models/*qwen/*.safetensors
+models/*/*.safetensors
+models/*/tokenizer.json
+models/*/vocab.json
+models/*/merges.txt
+models/*/model.safetensors.index.json
+models/*/*.bin
+models/*/*.gguf
 calib/
 results/

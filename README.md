@@ -20,14 +20,41 @@ Lance has a **custom architecture** (modified Qwen2.5-VL with parallel `_moe_gen
 
 ## Quantized model checkpoints
 
-Uploaded to Hugging Face under the original Lance base model:
+Uploaded to Hugging Face under the original Lance base model. **Full multimodal** variants preserve Lance's MoT routing — they run image/video generation + understanding. The MLX / CoreML variants are the **understanding-path LLM only** (extracted as a standard Qwen2) for Apple Silicon / iOS deployment.
+
+### Full multimodal — best for production use
 
 | Variant | Source | Quantized | Reduction |
 |---|---|---|---|
-| [`Reza2kn/Lance-3B-Video-AWQ-INT4`](https://huggingface.co/Reza2kn/Lance-3B-Video-AWQ-INT4) | 28.4 GB (F32) | 6.02 GB | 4.7× |
-| [`Reza2kn/Lance-3B-Video-NVFP4`](https://huggingface.co/Reza2kn/Lance-3B-Video-NVFP4) | 28.4 GB (F32) | 6.93 GB | 4.1× |
-| [`Reza2kn/Lance-3B-AWQ-INT4`](https://huggingface.co/Reza2kn/Lance-3B-AWQ-INT4) | 24.7 GB (F32) | 4.18 GB | 5.9× |
-| [`Reza2kn/Lance-3B-NVFP4`](https://huggingface.co/Reza2kn/Lance-3B-NVFP4) | 24.7 GB (F32) | 5.09 GB | 4.8× |
+| [`Reza2kn/Lance-3B-AWQ-INT4`](https://huggingface.co/Reza2kn/Lance-3B-AWQ-INT4) **(v2 g64)** | 24.7 GB | **4.31 GB** | 5.7× |
+| [`Reza2kn/Lance-3B-Video-AWQ-INT4`](https://huggingface.co/Reza2kn/Lance-3B-Video-AWQ-INT4) **(v2 g64)** | 28.4 GB | **6.15 GB** | 4.6× |
+| [`Reza2kn/Lance-3B-NVFP4`](https://huggingface.co/Reza2kn/Lance-3B-NVFP4) (Blackwell) | 24.7 GB | 5.09 GB | 4.8× |
+| [`Reza2kn/Lance-3B-Video-NVFP4`](https://huggingface.co/Reza2kn/Lance-3B-Video-NVFP4) (Blackwell) | 28.4 GB | 6.93 GB | 4.1× |
+
+### Apple Silicon — understanding LLM only
+
+| Variant | Quantized | Notes |
+|---|---|---|
+| [`Reza2kn/Lance-3B-und-MLX-4bit-DWQ`](https://huggingface.co/Reza2kn/Lance-3B-und-MLX-4bit-DWQ) | 1.6 GB | recommended (distilled scales) |
+| [`Reza2kn/Lance-3B-Video-und-MLX-4bit-DWQ`](https://huggingface.co/Reza2kn/Lance-3B-Video-und-MLX-4bit-DWQ) | 1.6 GB | same, from video checkpoint |
+| [`Reza2kn/Lance-3B-und-MLX-4bit`](https://huggingface.co/Reza2kn/Lance-3B-und-MLX-4bit) | 1.6 GB | plain post-training quant |
+| [`Reza2kn/Lance-3B-und-MLX-NVFP4`](https://huggingface.co/Reza2kn/Lance-3B-und-MLX-NVFP4) | 1.6 GB | NVFP4 mode for future ANE acceleration |
+| [`Reza2kn/Lance-3B-Video-und-MLX-4bit`](https://huggingface.co/Reza2kn/Lance-3B-Video-und-MLX-4bit) | 1.6 GB | |
+| [`Reza2kn/Lance-3B-Video-und-MLX-NVFP4`](https://huggingface.co/Reza2kn/Lance-3B-Video-und-MLX-NVFP4) | 1.6 GB | |
+| [`Reza2kn/Lance-3B-und-CoreML-palettized-4bit`](https://huggingface.co/Reza2kn/Lance-3B-und-CoreML-palettized-4bit) | 6.2 GB fp16 | for iOS / ANE pipelines |
+| [`Reza2kn/Lance-3B-Video-und-CoreML-palettized-4bit`](https://huggingface.co/Reza2kn/Lance-3B-Video-und-CoreML-palettized-4bit) | 6.2 GB fp16 | |
+
+## v2 lesson — group_size 64 fixed long-form drift
+
+v1 of the AWQ checkpoints used `group_size=128`. On Lance's bundled 6-sample x2t_image bench, this scored **33% exact-match** vs bf16 baseline. One case in particular ("$ spent on promotional events 1998") showed classic AWQ long-form degradation — the model inserted hallucinated entities ("Scott Levin and his family") around the correct number ($1.3 billion).
+
+v2 re-quantizes with `group_size=64`. Same calibration data, same recipe, just a finer scale granularity. Quality jumps to **50% exact-match** and case 4 becomes byte-identical to baseline:
+
+> v1 (g128): "_…the medical and scientific plan was 2000 dollars in revenue. During the 1990s, Scott Levin and his family were involved in the promotional activities…_"
+>
+> v2 (g64): "_According to the data from the proprietary market research, the total amount spent on the promotional meetings and events during 1998 was approximately $1.3 billion._" (matches bf16 exactly)
+
+The fix works because `o_proj` and `down_proj` can't have AWQ scales fused into a preceding norm (post-nonlinearity) — they get plain per-group quantization. Smaller groups = fewer outliers competing for the same scale = less per-channel quantization noise. Full eval at `docs/eval_g64.md`.
 
 ## Pipeline
 
