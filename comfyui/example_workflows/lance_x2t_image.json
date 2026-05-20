@@ -1,0 +1,71 @@
+{
+  "last_node_id": 4,
+  "last_link_id": 3,
+  "nodes": [
+    {
+      "id": 1,
+      "type": "LanceModelLoader",
+      "pos": [80, 80],
+      "size": [320, 100],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "outputs": [{"name": "lance_model", "type": "LANCE_MODEL", "links": [1]}],
+      "properties": {},
+      "widgets_values": ["Lance_3B", "awq_int4"]
+    },
+    {
+      "id": 2,
+      "type": "LoadImage",
+      "pos": [80, 240],
+      "size": [320, 320],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "outputs": [
+        {"name": "IMAGE", "type": "IMAGE", "links": [2]},
+        {"name": "MASK", "type": "MASK", "links": null}
+      ],
+      "properties": {},
+      "widgets_values": ["pie_chart.png", "image"]
+    },
+    {
+      "id": 3,
+      "type": "LanceX2TImage",
+      "pos": [460, 120],
+      "size": [380, 180],
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [
+        {"name": "lance_model", "type": "LANCE_MODEL", "link": 1},
+        {"name": "image", "type": "IMAGE", "link": 2}
+      ],
+      "outputs": [{"name": "STRING", "type": "STRING", "links": [3]}],
+      "properties": {},
+      "widgets_values": ["Is the largest segment greater than the sum of all other segments?"]
+    },
+    {
+      "id": 4,
+      "type": "ShowText|pysssss",
+      "pos": [880, 120],
+      "size": [380, 180],
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "inputs": [{"name": "text", "type": "STRING", "link": 3, "widget": {"name": "text"}}],
+      "outputs": [{"name": "STRING", "type": "STRING", "links": null}],
+      "properties": {},
+      "widgets_values": [""]
+    }
+  ],
+  "links": [
+    [1, 1, 0, 3, 0, "LANCE_MODEL"],
+    [2, 2, 0, 3, 1, "IMAGE"],
+    [3, 3, 0, 4, 0, "STRING"]
+  ],
+  "groups": [],
+  "config": {},
+  "extra": {},
+  "version": 0.4
+}
