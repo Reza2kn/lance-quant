@@ -186,14 +186,67 @@ class WQLinearINT4(torch.nn.Module):
         return torch.nn.functional.linear(x, self._dequantize(), self.bias)
 
 
+class WQLinearNVFP4(torch.nn.Module):
+    """NVFP4 E2M1 grouped in 16-element blocks with bf16 block scales.
+
+    This is the correctness path for Lance's NVFP4 checkpoints. It dequantizes
+    to bf16 before matmul; production speed still needs a fused Blackwell FP4
+    kernel, but this keeps the ComfyUI/runtime path functional.
+    """
+    FP4_LUT_POS = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
+
+    def __init__(self, in_features, out_features, block_size, bias, device, dtype=torch.bfloat16):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.block_size = block_size
+        self.compute_dtype = dtype
+        n_blocks = in_features // block_size
+        self.register_buffer("qweight", torch.zeros(
+            (out_features, in_features // 2), dtype=torch.uint8, device=device))
+        self.register_buffer("scales_bf16", torch.zeros(
+            (out_features, n_blocks), dtype=dtype, device=device))
+        if bias:
+            self.bias = torch.nn.Parameter(torch.zeros(out_features, dtype=dtype, device=device))
+        else:
+            self.register_parameter("bias", None)
+
+    def _dequantize(self):
+        packed = self.qweight
+        lo = packed & 0xF
+        hi = (packed >> 4) & 0xF
+        codes = torch.stack([lo, hi], dim=-1).reshape(self.out_features, self.in_features)
+        sign = torch.where(codes & 0x8 != 0, -1.0, 1.0).to(self.compute_dtype)
+        lut = self.FP4_LUT_POS.to(codes.device, dtype=self.compute_dtype)
+        vals = lut[(codes & 0x7).long()] * sign
+        vals = vals.reshape(self.out_features, -1, self.block_size)
+        return (vals * self.scales_bf16.unsqueeze(-1)).reshape(self.out_features, self.in_features)
+
+    def forward(self, x):
+        return torch.nn.functional.linear(x, self._dequantize(), self.bias)
+
+
+def _quant_files(quant_dir: Path):
+    if (quant_dir / "awq_meta.json").exists():
+        return quant_dir / "awq_meta.json", quant_dir / "awq_state_dict.safetensors", "awq"
+    if (quant_dir / "nvfp4_meta.json").exists():
+        return quant_dir / "nvfp4_meta.json", quant_dir / "nvfp4_state_dict.safetensors", "nvfp4"
+    raise FileNotFoundError(f"no awq_meta.json or nvfp4_meta.json in {quant_dir}")
+
+
 def swap_to_awq(model, awq_dir: Path, compute_dtype=torch.bfloat16):
-    meta_doc = json.loads((awq_dir / "awq_meta.json").read_text())
+    meta_path, _, kind = _quant_files(awq_dir)
+    meta_doc = json.loads(meta_path.read_text())
     meta = meta_doc["per_weight"]
-    # n_bit: 4 (default) uses WQLinearINT4 with nibble packing;
-    # n_bit: 5 uses WQLinearINT5 with byte-per-code storage.
     n_bit = meta_doc.get("n_bit", 4)
-    LinClass = WQLinearINT5 if n_bit == 5 else WQLinearINT4
-    print(f"[awq-swap] n_bit={n_bit}, swapping {len(meta)} linears to {LinClass.__name__}")
+    if kind == "nvfp4":
+        LinClass = WQLinearNVFP4
+        print(f"[quant-swap] kind=nvfp4, swapping {len(meta)} linears to {LinClass.__name__}")
+    else:
+        # n_bit: 4 (default) uses WQLinearINT4 with nibble packing;
+        # n_bit: 5 uses WQLinearINT5 with byte-per-code storage.
+        LinClass = WQLinearINT5 if n_bit == 5 else WQLinearINT4
+        print(f"[quant-swap] kind=awq n_bit={n_bit}, swapping {len(meta)} linears to {LinClass.__name__}")
     modules_by_name = dict(model.named_modules())
     swapped = 0
     for wkey in meta:
@@ -208,24 +261,34 @@ def swap_to_awq(model, awq_dir: Path, compute_dtype=torch.bfloat16):
             continue
         device = old.weight.device if old.weight.device.type != "meta" else (
             next((p.device for p in model.parameters() if p.device.type != "meta"), torch.device("cuda")))
-        new = LinClass(
-            in_features=info["shape"][1],
-            out_features=info["shape"][0],
-            group_size=info["group_size"],
-            bias=old.bias is not None,
-            device=device,
-            dtype=compute_dtype,
-        )
+        if kind == "nvfp4":
+            new = LinClass(
+                in_features=info["shape"][1],
+                out_features=info["shape"][0],
+                block_size=info["block_size"],
+                bias=old.bias is not None,
+                device=device,
+                dtype=compute_dtype,
+            )
+        else:
+            new = LinClass(
+                in_features=info["shape"][1],
+                out_features=info["shape"][0],
+                group_size=info["group_size"],
+                bias=old.bias is not None,
+                device=device,
+                dtype=compute_dtype,
+            )
         setattr(parent, lin_attr, new)
         modules_by_name[lin_name] = new
         swapped += 1
-    print(f"[awq-swap] swapped {swapped} linears")
+    print(f"[quant-swap] swapped {swapped} linears")
     return modules_by_name
 
 
 def stream_awq_buffers(modules_by_name, awq_dir: Path):
-    sd_path = awq_dir / "awq_state_dict.safetensors"
-    print(f"[awq-stream] loading {sd_path}")
+    _, sd_path, _ = _quant_files(awq_dir)
+    print(f"[quant-stream] loading {sd_path}")
     t0 = time.time()
     loaded_q = 0
     loaded_pass = 0
@@ -235,7 +298,7 @@ def stream_awq_buffers(modules_by_name, awq_dir: Path):
     with safe_open(str(sd_path), framework="pt", device="cpu") as f:
         for k in f.keys():
             # quant-buffer key like ".../q_proj.qweight"
-            if k.endswith((".qweight", ".scales", ".zeros")):
+            if k.endswith((".qweight", ".scales", ".zeros", ".scales_bf16")):
                 base, suffix = k.rsplit(".", 1)
                 mod = modules_by_name.get(base)
                 if mod is None or not hasattr(mod, suffix):
@@ -253,14 +316,14 @@ def stream_awq_buffers(modules_by_name, awq_dir: Path):
 
     if torch.cuda.is_available():
         torch.cuda.synchronize()
-    print(f"[awq-stream] {loaded_q} quant buffers loaded in {time.time()-t0:.1f}s")
+    print(f"[quant-stream] {loaded_q} quant buffers loaded in {time.time()-t0:.1f}s")
 
 
 def stream_pass_through_weights(model, awq_dir: Path):
     """Load the non-quantized (bf16 pass-through) weights from awq_state_dict.
     For Lance the pass-through covers ViT, norms, embeds, time_embedder, llm2vae,
     vae2llm, latent_pos_embed (but that one's regen'd from sinusoid)."""
-    sd_path = awq_dir / "awq_state_dict.safetensors"
+    _, sd_path, _ = _quant_files(awq_dir)
     own = dict(model.state_dict(keep_vars=True))
     loaded = 0
     skipped_quant = 0
@@ -353,6 +416,10 @@ def main():
     ap.add_argument("--video_height", type=int, default=768)
     ap.add_argument("--video_width", type=int, default=768)
     ap.add_argument("--validation_num_timesteps", type=int, default=30)
+    ap.add_argument("--cfg_scale", type=float, default=4.0)
+    ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--example_json", default=None,
+                    help="optional Lance validation/example config or manifest")
     ap.add_argument("--mode", choices=["ondemand", "cached"], default="cached",
                     help="ondemand = dequant every fwd (low VRAM, ~10x slow); "
                          "cached = dequant once per linear (peaks VRAM, ~baseline speed)")
@@ -393,7 +460,7 @@ def main():
         "--apply_qwen_2_5_vl_pos_emb", "true",
         "--apply_chat_template",   "false",
         "--cfg_type",              "0",
-        "--validation_data_seed",  "42",
+        "--validation_data_seed",  str(args.seed),
         "--video_height",          str(args.video_height),
         "--video_width",           str(args.video_width),
         "--num_frames",            str(args.num_frames),
@@ -401,9 +468,11 @@ def main():
         "--save_path_gen",         args.save_path_gen,
         "--resolution",            args.resolution,
         "--text_template",         "true",
-        "--cfg_text_scale",        "4.0",
+        "--cfg_text_scale",        str(args.cfg_scale),
         "--use_KVcache",           "true",
     ]
+    if args.example_json:
+        sys.argv.extend(["--val_dataset_config_file", args.example_json])
 
     _patch_for_meta_then_awq(args.awq_dir.resolve())
 

@@ -16,8 +16,9 @@ Protocol (line-delimited JSON):
 The companion `nodes.py` (v2) spawns this worker on the first LanceModelLoader
 call, keeps it alive in a module-global, and pipes requests to it.
 
-Tested only as a sketch in v1; the full integration is planned for v2 of the
-ComfyUI node pack. See README.md.
+The companion `nodes.py` starts this process for the `resident_worker` backend
+and falls back to the subprocess backend if the local Lance install cannot
+support resident execution.
 """
 
 from __future__ import annotations
@@ -48,11 +49,13 @@ def _meta_init():
 
 
 def build_lance_resident(*, lance_src: Path, model_path: str, vit_path: str,
-                          awq_dir: str | None, save_path_gen: str):
+                          awq_dir: str | None, save_path_gen: str,
+                          script_root: Path):
     """Construct Lance with our memory-frugal loader + (optionally) AWQ swap.
     Returns a dict holding model, vae, tokenizer, training_args, image_token_id
     — everything `validate_on_fixed_batch` needs."""
     sys.path.insert(0, str(lance_src))
+    sys.path.insert(0, str(script_root))
     from modeling.lance import Lance
     from modeling.lance.qwen2_navit import Qwen2ForCausalLM
     from modeling.vit.qwen2_5_vl_vit import Qwen2_5_VisionTransformerPretrainedModel
@@ -134,10 +137,10 @@ def build_lance_resident(*, lance_src: Path, model_path: str, vit_path: str,
         return orig_validate(*a, **kw)
     IL.validate_on_fixed_batch = _capture
 
-    print("[worker] building Lance...", flush=True)
+    print("[worker] building Lance...", file=sys.stderr, flush=True)
     t0 = time.time()
     IL.main()                                  # builds + runs 1 bootstrap sample
-    print(f"[worker] build+bootstrap in {time.time()-t0:.1f}s", flush=True)
+    print(f"[worker] build+bootstrap in {time.time()-t0:.1f}s", file=sys.stderr, flush=True)
 
     # Restore the real validate for subsequent calls
     IL.validate_on_fixed_batch = orig_validate
@@ -165,6 +168,12 @@ def serve(state: dict):
             ia = state["inference_args"]
             ia.task = task
             ia.save_path_gen = save_dir
+            ia.validation_num_timesteps = req.get("num_steps", getattr(ia, "validation_num_timesteps", 30))
+            ia.num_frames = req.get("num_frames", getattr(ia, "num_frames", 1))
+            ia.video_height = req.get("height", getattr(ia, "video_height", 768))
+            ia.video_width = req.get("width", getattr(ia, "video_width", 768))
+            ia.cfg_text_scale = req.get("cfg_scale", getattr(ia, "cfg_text_scale", 4.0))
+            ia.validation_data_seed = req.get("seed", getattr(ia, "validation_data_seed", 42))
             ia.prompt_data_dict = {}
 
             # Build a one-shot ValidationDataset on the user's manifest
@@ -208,6 +217,7 @@ def main():
     import argparse
     ap = argparse.ArgumentParser()
     ap.add_argument("--lance_src", type=Path, required=True)
+    ap.add_argument("--script_root", type=Path, required=True)
     ap.add_argument("--model_path", required=True)
     ap.add_argument("--vit_path", required=True)
     ap.add_argument("--awq_dir", default=None)
@@ -222,6 +232,7 @@ def main():
         lance_src=args.lance_src,
         model_path=args.model_path, vit_path=args.vit_path,
         awq_dir=args.awq_dir, save_path_gen=args.save_path_gen,
+        script_root=args.script_root,
     )
     serve(state)
 

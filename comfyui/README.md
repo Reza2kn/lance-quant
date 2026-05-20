@@ -2,13 +2,17 @@
 
 ComfyUI custom-node pack for [ByteDance Lance](https://huggingface.co/bytedance-research/Lance) and its quantized variants.
 
-**v1 — subprocess wrapper, slow but correct.** Each task node shells out to a fresh `inference_lance.py` invocation (~30–60 s per generation due to model reload). v2 will hold the model resident across calls.
+**v2 — resident worker with subprocess fallback.** The model loader can start a
+long-lived Lance worker per checkpoint/precision combo, so repeated prompts do
+not pay the full model-load cost. The older subprocess backend is still
+available and can be used as a fallback when a local Lance checkout is missing
+the resident-worker hooks.
 
 ## Nodes shipped
 
 | Node | What it does |
 |---|---|
-| **Lance: Model Loader** | Picks checkpoint flavor (`Lance_3B` or `Lance_3B_Video`) and precision (`bf16` / `awq_int4` / `nvfp4`); returns a `LANCE_MODEL` handle. |
+| **Lance: Model Loader** | Picks checkpoint flavor (`Lance_3B` or `Lance_3B_Video`), precision (`bf16` / `awq_int4` / `nvfp4`), and backend (`resident_worker` / `subprocess`); returns a `LANCE_MODEL` handle. |
 | **Lance: Text → Image** | t2i, 768² default |
 | **Lance: Text → Video** | t2v (needs `Lance_3B_Video`) |
 | **Lance: Image Edit** | instruction-guided edit |
@@ -73,6 +77,19 @@ ComfyUI custom-node pack for [ByteDance Lance](https://huggingface.co/bytedance-
 
 5. **Restart ComfyUI**. Nodes appear under the `Lance` category.
 
+## Backend modes
+
+| Backend | Behavior |
+|---|---|
+| `resident_worker` | Starts `lance_worker.py` once per selected checkpoint and sends later requests over line-delimited JSON. Best for interactive use. |
+| `subprocess` | Runs `scripts/run_baseline.py` or `scripts/run_quant_eval.py` for every node execution. Slower, but useful for debugging and for Lance checkouts where resident execution fails. |
+
+The loader has `fallback_to_subprocess` enabled by default. Turn it off if you
+want resident-worker errors to fail loudly during development.
+
+Set `LANCE_QUANT_PATH` if the ComfyUI custom node has been copied out of the
+repo and cannot find `scripts/run_baseline.py` / `scripts/run_quant_eval.py`.
+
 ## VRAM requirements
 
 | Precision | Approx GPU VRAM (LLM only, bf16 activations) |
@@ -83,11 +100,12 @@ ComfyUI custom-node pack for [ByteDance Lance](https://huggingface.co/bytedance-
 
 (Add ~2 GB for VAE during generation tasks.)
 
-## Limitations (v1)
+## Limitations
 
-- Per-call model reload makes each generation ~30–60 s, even on a fast GPU. v2 will refactor `inference_lance.main` to expose a `build` step separately from the per-sample `validate` step so the loader can hold the model resident.
 - No support yet for `x2t_video` or `video_edit` (need video-frame plumbing).
-- Quantized inference path uses pure-PyTorch on-demand dequant; a fused INT4 GEMM kernel (Triton / marlin / exllamav2 for INT4; TensorRT-LLM for NVFP4) would be 5–10× faster.
+- Quantized inference path uses pure-PyTorch on-demand dequant for AWQ and
+  NVFP4 correctness. A fused INT4/FP4 GEMM kernel (Triton / marlin /
+  exllamav2 for INT4; TensorRT-LLM for NVFP4) would be much faster.
 
 ## License
 

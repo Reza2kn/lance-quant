@@ -6,9 +6,7 @@ This pack exposes:
   * LanceT2I           — text-to-image
   * LanceT2V           — text-to-video
   * LanceImageEdit     — instruction-guided image edit
-  * LanceVideoEdit     — instruction-guided video edit
   * LanceX2TImage      — image understanding / VQA
-  * LanceX2TVideo      — video understanding / VQA
 
 The node pack assumes you have ByteDance/Lance cloned and accessible. Set
 `LANCE_SRC_PATH` env var to its path, or place the repo at

@@ -179,6 +179,10 @@ def main():
     ap.add_argument("--video_height", type=int, default=768)
     ap.add_argument("--video_width", type=int, default=768)
     ap.add_argument("--validation_num_timesteps", type=int, default=30)
+    ap.add_argument("--cfg_scale", type=float, default=4.0)
+    ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--example_json", default=None,
+                    help="optional Lance validation/example config or manifest")
     args = ap.parse_args()
 
     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
@@ -212,7 +216,7 @@ def main():
         "--apply_qwen_2_5_vl_pos_emb", "true",
         "--apply_chat_template",   "false",
         "--cfg_type",              "0",
-        "--validation_data_seed",  "42",
+        "--validation_data_seed",  str(args.seed),
         "--video_height",          str(args.video_height),
         "--video_width",           str(args.video_width),
         "--num_frames",            str(args.num_frames),
@@ -220,9 +224,11 @@ def main():
         "--save_path_gen",         args.save_path_gen,
         "--resolution",            args.resolution,
         "--text_template",         "true",
-        "--cfg_text_scale",        "4.0",
+        "--cfg_text_scale",        str(args.cfg_scale),
         "--use_KVcache",           "true",
     ]
+    if args.example_json:
+        sys.argv.extend(["--val_dataset_config_file", args.example_json])
 
     _patch_inference_lance_module()
 
