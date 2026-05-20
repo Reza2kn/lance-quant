@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.DS_Store
+models/*/awq_state_dict.safetensors
+models/*/nvfp4_state_dict.safetensors
+models/*qwen/*.safetensors
+calib/
+results/
